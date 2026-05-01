@@ -1,41 +1,29 @@
-# =============================================================
-# VARIABLES - parametry które możesz zmieniać bez edytowania main.tf
-# Wartości podajesz w terraform.tfvars albo przez pipeline
-# =============================================================
-
-variable "environment" {
-  description = "Nazwa środowiska (dev/staging/prod)"
+variable "resource_group_name" {
+  description = "Nazwa Resource Group dla AKS"
   type        = string
-  default     = "dev"
+  default     = "aks-learning-rg"
 }
 
 variable "location" {
-  description = "Region Azure - westeurope jest blisko Polski"
+  description = "Region Azure"
   type        = string
   default     = "westeurope"
 }
 
-variable "vm_size" {
-  description = "Rozmiar VM-ek. B2s = najtańsze co działa z K8s"
+variable "cluster_name" {
+  description = "Nazwa klastra AKS"
   type        = string
-  default     = "Standard_B2s"
+  default     = "aks-learning-cluster"
 }
 
-variable "admin_username" {
-  description = "Nazwa użytkownika na VM-kach"
-  type        = string
-  default     = "azureuser"
+variable "worker_count" {
+  description = "Liczba worker node'ów (2 lub 3)"
+  type        = number
+  default     = 2
 }
 
-variable "ssh_public_key" {
-  description = "Twój publiczny klucz SSH. Pipeline wstrzykuje go jako secret."
+variable "worker_vm_size" {
+  description = "Rozmiar VM dla worker node'ów"
   type        = string
-  # NIE dawaj tu default! To secret - idzie przez pipeline variables
-}
-
-variable "suffix" {
-  description = "Unikalny suffix dla storage account (tylko małe litery i cyfry, max 8 znaków)"
-  type        = string
-  default     = "abc123"
-  # ZMIEŃ TO na coś unikalnego! Storage account musi mieć globalnie unikalną nazwę
+  default     = "Standard_B2s"  # 2 vCPU, 4GB RAM - tanie do nauki
 }

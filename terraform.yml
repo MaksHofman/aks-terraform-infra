@@ -1,0 +1,70 @@
+name: Terraform AKS Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pobierz kod z repo
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # 2. Zainstaluj Terraform CLI
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.0
+
+      # 3. terraform init - pobiera providery, łączy się z backendem (Blob Storage)
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+
+      # 4. terraform fmt --check - sprawdza formatowanie kodu
+      - name: Terraform Format Check
+        run: terraform fmt -check
+        working-directory: ./terraform
+
+      # 5. terraform validate - sprawdza poprawność składni
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ./terraform
+
+      # 6. terraform plan - pokazuje co zostanie stworzone/zmienione
+      #    Na PR: tylko plan (bez apply), widoczny w komentarzu PR
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        working-directory: ./terraform
+
+      # 7. terraform apply - TYLKO gdy push do main (nie na PR!)
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve tfplan
+        working-directory: ./terraform
+
+      # 8. Pobierz kubeconfig i sprawdź węzły klastra
+      - name: Verify Kubernetes nodes
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          az login --service-principal \
+            -u $ARM_CLIENT_ID \
+            -p $ARM_CLIENT_SECRET \
+            --tenant $ARM_TENANT_ID
+          az aks get-credentials \
+            --resource-group aks-learning-rg \
+            --name aks-learning-cluster \
+            --overwrite-existing
+          kubectl get nodes
