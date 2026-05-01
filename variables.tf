@@ -7,7 +7,7 @@ variable "resource_group_name" {
 variable "location" {
   description = "Region Azure"
   type        = string
-  default     = "northeurope"
+  default     = "polandcentral"
 }
 
 variable "cluster_name" {
@@ -25,5 +25,5 @@ variable "worker_count" {
 variable "worker_vm_size" {
   description = "Rozmiar VM dla worker node'ów"
   type        = string
-  default     = "Standard_B2s"  # 2 vCPU, 4GB RAM - tanie do nauki
+  default     = "Standard_B2s_v2"  # 2 vCPU, 4GB RAM - tanie do nauki
 }
