@@ -1,0 +1,276 @@
+# =============================================================
+# AZURE DEVOPS CD PIPELINE
+# =============================================================
+# Co robi ten pipeline krok po kroku:
+#
+# STAGE 1 - Terraform
+#   ├── terraform init   (pobierz providery, połącz z backend)
+#   ├── terraform plan   (pokaż co zostanie zmienione - nie robi nic!)
+#   └── terraform apply  (FAKTYCZNIE tworzy VM-ki na Azure)
+#
+# STAGE 2 - Setup K8s
+#   ├── SSH na mastera → uruchom setup-master.sh
+#   ├── Pobierz join command z mastera
+#   └── SSH na każdego workera → uruchom setup-worker.sh z join command
+#
+# STAGE 3 - Verify
+#   └── Sprawdź czy wszystkie nody są w stanie Ready
+# =============================================================
+
+trigger:
+  branches:
+    include:
+      - main  # pipeline odpala się gdy coś wpada na branch main
+
+pool:
+  vmImage: 'ubuntu-latest'  # agent Azure DevOps na którym leci pipeline
+
+# =============================================================
+# VARIABLES - wartości których używamy w całym pipeline
+# Sekrety (SSH key, client secret) trzymamy w Azure DevOps
+# Library > Variable Groups - NIE w tym pliku!
+# =============================================================
+variables:
+  - group: k8s-cluster-secrets  # <- zdefiniuj tę grupę w Azure DevOps!
+  - name: TF_VERSION
+    value: '1.7.0'
+  - name: TERRAFORM_DIR
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+  - name: SCRIPTS_DIR
+    value: '$(System.DefaultWorkingDirectory)/scripts'
+
+# =============================================================
+# STAGE 1: TERRAFORM - postawienie infrastruktury
+# =============================================================
+stages:
+- stage: Terraform
+  displayName: '🏗️ Terraform - Tworzenie VM-ek'
+  jobs:
+  - job: TerraformApply
+    displayName: 'Terraform Init → Plan → Apply'
+    steps:
+
+    # Zainstaluj Terraform na agencie
+    - task: TerraformInstaller@1
+      displayName: 'Instalacja Terraform $(TF_VERSION)'
+      inputs:
+        terraformVersion: $(TF_VERSION)
+
+    # terraform init - pobiera providery, łączy się z backend (Azure Blob)
+    - task: TerraformTaskV4@4
+      displayName: 'terraform init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: $(TERRAFORM_DIR)
+        environmentServiceNameAzureRM: 'Azure-Service-Connection'
+    # terraform plan - tylko POKAZUJE co zostanie zrobione, nic nie tworzy
+    # Dobra praktyka: review planu zanim apply
+    - task: TerraformTaskV4@4
+      displayName: 'terraform plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: $(TERRAFORM_DIR)
+        environmentServiceNameAzureRM: 'Azure-Service-Connection'
+        commandOptions: >
+          -var="ssh_public_key=$(SSH_PUBLIC_KEY)"
+          -var="suffix=$(TF_SUFFIX)"
+          -var="environment=dev"
+          -out=tfplan
+
+    # terraform apply - TWORZY VM-ki (używa planu z poprzedniego kroku)
+    - task: TerraformTaskV4@4
+      displayName: 'terraform apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: $(TERRAFORM_DIR)
+        environmentServiceNameAzureRM: 'Azure-Service-Connection'
+        commandOptions: 'tfplan'  # użyj zapisanego planu
+
+    # Pobierz outputy z Terraform (IP mastera i workerów)
+    # i zapisz jako zmienne pipeline żeby kolejny stage je widział
+    - bash: |
+        cd $(TERRAFORM_DIR)
+        
+        MASTER_IP=$(terraform output -raw master_public_ip)
+        MASTER_PRIVATE=$(terraform output -raw master_private_ip)
+        WORKER_IPS=$(terraform output -json worker_private_ips | jq -r '.[]' | tr '\n' ',')
+        
+        # Zapisz do pipeline variables
+        echo "##vso[task.setvariable variable=MASTER_PUBLIC_IP;isOutput=true]$MASTER_IP"
+        echo "##vso[task.setvariable variable=MASTER_PRIVATE_IP;isOutput=true]$MASTER_PRIVATE"
+        echo "##vso[task.setvariable variable=WORKER_PRIVATE_IPS;isOutput=true]$WORKER_IPS"
+        
+        echo "Master public IP: $MASTER_IP"
+        echo "Master private IP: $MASTER_PRIVATE"
+        echo "Worker IPs: $WORKER_IPS"
+      displayName: 'Pobierz Terraform outputs'
+      name: TFOutputs  # nazwa ważna - kolejny stage odwołuje się przez tę nazwę
+
+# =============================================================
+# STAGE 2: SETUP K8s - instalacja i konfiguracja klastra
+# =============================================================
+- stage: SetupK8s
+  displayName: '⚙️ Setup Kubernetes'
+  dependsOn: Terraform  # odpal dopiero po stage Terraform
+  variables:
+    # Pobierz zmienne z poprzedniego stage
+    MASTER_PUBLIC_IP: $[stageDependencies.Terraform.TerraformApply.outputs['TFOutputs.MASTER_PUBLIC_IP']]
+    MASTER_PRIVATE_IP: $[stageDependencies.Terraform.TerraformApply.outputs['TFOutputs.MASTER_PRIVATE_IP']]
+    WORKER_PRIVATE_IPS: $[stageDependencies.Terraform.TerraformApply.outputs['TFOutputs.WORKER_PRIVATE_IPS']]
+
+  jobs:
+  - job: SetupMaster
+    displayName: 'Konfiguracja Master Node'
+    steps:
+
+    # Zapisz klucz SSH do pliku (ze zmiennej secret w Azure DevOps)
+    - bash: |
+        echo "$(SSH_PRIVATE_KEY)" > /tmp/k8s_id_rsa
+        chmod 600 /tmp/k8s_id_rsa
+      displayName: 'Przygotowanie klucza SSH'
+
+    # Poczekaj aż VM jest dostępna przez SSH (może chwilę potrwać po deploy)
+    - bash: |
+        echo "Czekam na SSH na masterze $(MASTER_PUBLIC_IP)..."
+        for i in $(seq 1 20); do
+          ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i /tmp/k8s_id_rsa \
+              azureuser@$(MASTER_PUBLIC_IP) "echo OK" && break
+          echo "Próba $i/20 nieudana, czekam 30s..."
+          sleep 30
+        done
+      displayName: 'Czekaj na dostępność SSH'
+
+    # Skopiuj skrypt setup-master.sh na VM
+    - bash: |
+        scp -o StrictHostKeyChecking=no \
+            -i /tmp/k8s_id_rsa \
+            $(SCRIPTS_DIR)/setup-master.sh \
+            azureuser@$(MASTER_PUBLIC_IP):/tmp/setup-master.sh
+      displayName: 'Kopiowanie skryptu na mastera'
+
+    # Uruchom instalację K8s na masterze
+    - bash: |
+        ssh -o StrictHostKeyChecking=no \
+            -i /tmp/k8s_id_rsa \
+            azureuser@$(MASTER_PUBLIC_IP) \
+            "chmod +x /tmp/setup-master.sh && sudo /tmp/setup-master.sh $(MASTER_PRIVATE_IP)"
+      displayName: 'Instalacja K8s na masterze'
+      timeoutInMinutes: 15  # instalacja może trwać do 10-15 minut
+
+    # Pobierz join command z mastera - workery tego potrzebują
+    - bash: |
+        JOIN_CMD=$(ssh -o StrictHostKeyChecking=no \
+                       -i /tmp/k8s_id_rsa \
+                       azureuser@$(MASTER_PUBLIC_IP) \
+                       "sudo cat /tmp/kubeadm_join_command.sh")
+        
+        echo "Join command pobrany pomyślnie"
+        # Zapisz jako output variable dla następnego joba
+        echo "##vso[task.setvariable variable=JOIN_COMMAND;isOutput=true]$JOIN_CMD"
+      displayName: 'Pobierz join command'
+      name: GetJoinCmd
+
+  - job: SetupWorkers
+    displayName: 'Konfiguracja Worker Nodes'
+    dependsOn: SetupMaster  # dopiero po masterze!
+    variables:
+      JOIN_COMMAND: $[dependencies.SetupMaster.outputs['GetJoinCmd.JOIN_COMMAND']]
+    steps:
+
+    - bash: |
+        echo "$(SSH_PRIVATE_KEY)" > /tmp/k8s_id_rsa
+        chmod 600 /tmp/k8s_id_rsa
+      displayName: 'Przygotowanie klucza SSH'
+
+    # Skonfiguruj wszystkie 3 workery równolegle (pętla)
+    - bash: |
+        # WORKER_PRIVATE_IPS to lista "10.0.1.20,10.0.1.21,10.0.1.22,"
+        # Musimy się dostać do workerów PRZEZ mastera (SSH jump host)
+        # bo workery nie mają publicznego IP!
+        
+        IFS=',' read -ra WORKERS <<< "$(WORKER_PRIVATE_IPS)"
+        
+        for WORKER_IP in "${WORKERS[@]}"; do
+          [ -z "$WORKER_IP" ] && continue  # pomiń pustą ostatnią wartość
+          
+          echo "============================================"
+          echo "Konfiguruję worker: $WORKER_IP"
+          echo "============================================"
+          
+          # Skopiuj skrypt na workera (przez mastera jako jump host)
+          scp -o StrictHostKeyChecking=no \
+              -o "ProxyJump azureuser@$(MASTER_PUBLIC_IP)" \
+              -i /tmp/k8s_id_rsa \
+              $(SCRIPTS_DIR)/setup-worker.sh \
+              azureuser@${WORKER_IP}:/tmp/setup-worker.sh
+          
+          # Uruchom instalację na workerze
+          ssh -o StrictHostKeyChecking=no \
+              -o "ProxyJump azureuser@$(MASTER_PUBLIC_IP)" \
+              -i /tmp/k8s_id_rsa \
+              azureuser@${WORKER_IP} \
+              "chmod +x /tmp/setup-worker.sh && sudo /tmp/setup-worker.sh '$(JOIN_COMMAND)'"
+          
+          echo "Worker $WORKER_IP skonfigurowany!"
+        done
+      displayName: 'Konfiguracja wszystkich workerów'
+      timeoutInMinutes: 30
+
+# =============================================================
+# STAGE 3: VERIFY - sprawdź czy klaster działa
+# =============================================================
+- stage: Verify
+  displayName: '✅ Weryfikacja klastra'
+  dependsOn: SetupK8s
+  variables:
+    MASTER_PUBLIC_IP: $[stageDependencies.Terraform.TerraformApply.outputs['TFOutputs.MASTER_PUBLIC_IP']]
+
+  jobs:
+  - job: VerifyCluster
+    displayName: 'Sprawdź status nodów'
+    steps:
+
+    - bash: |
+        echo "$(SSH_PRIVATE_KEY)" > /tmp/k8s_id_rsa
+        chmod 600 /tmp/k8s_id_rsa
+      displayName: 'Przygotowanie klucza SSH'
+
+    # Poczekaj aż wszystkie nody będą Ready
+    - bash: |
+        echo "Czekam aż wszystkie 4 nody będą w stanie Ready..."
+        
+        for i in $(seq 1 20); do
+          READY_COUNT=$(ssh -o StrictHostKeyChecking=no \
+                            -i /tmp/k8s_id_rsa \
+                            azureuser@$(MASTER_PUBLIC_IP) \
+                            "kubectl get nodes --no-headers | grep ' Ready' | wc -l")
+          
+          echo "Nody Ready: $READY_COUNT/4"
+          
+          if [ "$READY_COUNT" -eq 4 ]; then
+            echo "✅ Wszystkie nody Ready!"
+            break
+          fi
+          
+          echo "Czekam 30s... (próba $i/20)"
+          sleep 30
+        done
+        
+        if [ "$READY_COUNT" -ne 4 ]; then
+          echo "❌ BŁĄD: Nie wszystkie nody są Ready po 10 minutach!"
+          exit 1
+        fi
+      displayName: 'Czekaj na Ready nodes'
+
+    # Pokaż finalny status
+    - bash: |
+        ssh -o StrictHostKeyChecking=no \
+            -i /tmp/k8s_id_rsa \
+            azureuser@$(MASTER_PUBLIC_IP) \
+            "kubectl get nodes -o wide && echo '' && kubectl get pods -A"
+      displayName: 'Pokaż status klastra'
