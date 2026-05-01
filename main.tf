@@ -8,7 +8,7 @@ terraform {
 
   # Backend trzyma stan Terraforma w Twoim Blob Storage
   backend "azurerm" {
-    resource_group_name  = "tfstatetest331"
+    resource_group_name  = "rg-terraform-state"
     storage_account_name = "tfstatetest331"
     container_name       = "tfstate"
     key                  = "aks/terraform.tfstate"
